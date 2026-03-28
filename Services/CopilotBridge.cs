@@ -82,13 +82,24 @@ public sealed class CopilotBridge : IAsyncDisposable
 
         session.On(evt =>
         {
+            _logger.LogDebug("Event received: {EventType}", evt.GetType().Name);
             switch (evt)
             {
                 case AssistantMessageEvent msg:
                     if (!string.IsNullOrEmpty(msg.Data.Content))
                         responseContent.Append(msg.Data.Content);
                     if (msg.Data.ToolRequests != null && msg.Data.ToolRequests.Any())
+                    {
+                        _logger.LogInformation("Tool requests received: {Count}", msg.Data.ToolRequests.Count());
+                        foreach (var tr in msg.Data.ToolRequests)
+                            _logger.LogInformation("  Tool: {Name}, Args: {Args}", tr.Name, tr.Arguments);
                         toolRequests.AddRange(msg.Data.ToolRequests);
+                    }
+                    break;
+
+                case ToolExecutionStartEvent toolStart:
+                    _logger.LogInformation("ToolExecutionStart: {ToolName} (CallId: {CallId})",
+                        toolStart.Data.ToolName, toolStart.Data.ToolCallId);
                     break;
 
                 case AssistantUsageEvent usage:
@@ -102,7 +113,13 @@ public sealed class CopilotBridge : IAsyncDisposable
 
                 case SessionErrorEvent err:
                     errorMessage = err.Data?.Message ?? "Unknown session error";
+                    _logger.LogWarning("SessionError: {Error}", errorMessage);
                     sessionDone.TrySetResult();
+                    break;
+
+                default:
+                    _logger.LogDebug("Unhandled event: {EventType} - {Data}", evt.GetType().Name,
+                        JsonSerializer.Serialize(evt, new JsonSerializerOptions { WriteIndented = false }));
                     break;
             }
         });
@@ -364,15 +381,12 @@ public sealed class CopilotBridge : IAsyncDisposable
         if (!string.IsNullOrEmpty(request.ReasoningEffort))
             config.ReasoningEffort = request.ReasoningEffort;
 
-        // System message
-        if (!string.IsNullOrEmpty(systemMessage))
+        // Always replace system message to prevent Copilot's built-in prompt from interfering
+        config.SystemMessage = new SystemMessageConfig
         {
-            config.SystemMessage = new SystemMessageConfig
-            {
-                Mode = SystemMessageMode.Replace,
-                Content = systemMessage,
-            };
-        }
+            Mode = SystemMessageMode.Replace,
+            Content = systemMessage ?? "You are a helpful assistant.",
+        };
 
         // Register client-defined tools
         if (request.Tools?.Count > 0)
@@ -384,8 +398,8 @@ public sealed class CopilotBridge : IAsyncDisposable
                     t.Function.Parameters))
                 .ToList();
 
-            // Disable built-in tools so only client tools are visible
-            config.AvailableTools = new List<string>();
+            // Enable only client-defined tools, disable all built-in tools
+            config.AvailableTools = request.Tools.Select(t => t.Function.Name).ToList();
         }
 
         return config;
