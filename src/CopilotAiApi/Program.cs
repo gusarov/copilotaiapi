@@ -174,3 +174,6 @@ lifetime.ApplicationStopping.Register(() =>
 });
 
 app.Run();
+
+// Expose Program for WebApplicationFactory in tests
+public partial class Program { }
