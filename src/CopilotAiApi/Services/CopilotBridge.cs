@@ -170,7 +170,7 @@ public sealed class CopilotBridge : IAsyncDisposable
                     Message = new ResponseMessage
                     {
                         Role = "assistant",
-                        Content = responseContent.ToString(),
+                        Content = SanitizeContent(responseContent.ToString(), request.ResponseFormat),
                     },
                     FinishReason = "stop",
                 }
@@ -381,11 +381,14 @@ public sealed class CopilotBridge : IAsyncDisposable
         if (!string.IsNullOrEmpty(request.ReasoningEffort))
             config.ReasoningEffort = request.ReasoningEffort;
 
+        // Append response_format instructions to system message so the model honours them
+        var effectiveSystemMessage = BuildSystemMessageWithFormat(systemMessage, request.ResponseFormat);
+
         // Always replace system message to prevent Copilot's built-in prompt from interfering
         config.SystemMessage = new SystemMessageConfig
         {
             Mode = SystemMessageMode.Replace,
-            Content = systemMessage ?? "You are a helpful assistant.",
+            Content = effectiveSystemMessage,
         };
 
         // Register client-defined tools
@@ -403,6 +406,44 @@ public sealed class CopilotBridge : IAsyncDisposable
         }
 
         return config;
+    }
+
+    /// <summary>
+    /// Builds the effective system message, appending JSON output instructions
+    /// when response_format is "json_object" or "json_schema".
+    /// </summary>
+    private static string BuildSystemMessageWithFormat(string? systemMessage, ResponseFormat? format)
+    {
+        var baseMessage = systemMessage ?? "You are a helpful assistant.";
+
+        if (format == null || format.Type == "text")
+            return baseMessage;
+
+        var sb = new StringBuilder(baseMessage);
+
+        if (format.Type == "json_object")
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("IMPORTANT: You must respond with valid JSON only. Do not include any text outside of the JSON object. Do not use markdown code blocks.");
+        }
+        else if (format.Type == "json_schema" && format.JsonSchema != null)
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("IMPORTANT: You must respond with valid JSON only that strictly conforms to the following JSON schema. Do not include any text outside of the JSON object. Do not use markdown code blocks.");
+            if (!string.IsNullOrEmpty(format.JsonSchema.Description))
+            {
+                sb.AppendLine($"Schema description: {format.JsonSchema.Description}");
+            }
+            if (format.JsonSchema.Schema.HasValue)
+            {
+                sb.AppendLine("Schema:");
+                sb.AppendLine(format.JsonSchema.Schema.Value.ToString());
+            }
+        }
+
+        return sb.ToString().TrimEnd();
     }
 
     // ─── Prompt Builder ────────────────────────────────────────────────
@@ -522,6 +563,33 @@ public sealed class CopilotBridge : IAsyncDisposable
         var json = JsonSerializer.Serialize(chunk, JsonOptions.Default);
         await context.Response.WriteAsync($"data: {json}\n\n", ct);
         await context.Response.Body.FlushAsync(ct);
+    }
+
+    /// <summary>
+    /// Strips markdown code fences that the model may wrap around JSON output,
+    /// e.g. ```json\n{...}\n``` → {...}
+    /// Only applied when response_format requests JSON.
+    /// </summary>
+    private static string SanitizeContent(string content, ResponseFormat? format)
+    {
+        if (format == null || (format.Type != "json_object" && format.Type != "json_schema"))
+            return content;
+
+        var trimmed = content.Trim();
+
+        // Strip opening fence: ```json or ```
+        if (trimmed.StartsWith("```"))
+        {
+            var newlineIdx = trimmed.IndexOf('\n');
+            if (newlineIdx >= 0)
+                trimmed = trimmed[(newlineIdx + 1)..];
+        }
+
+        // Strip closing fence: ```
+        if (trimmed.EndsWith("```"))
+            trimmed = trimmed[..^3];
+
+        return trimmed.Trim();
     }
 
     private static ModelsResponse GetDefaultModels()

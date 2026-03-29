@@ -49,6 +49,34 @@ public class ChatCompletionRequest
 
     [JsonPropertyName("reasoning_effort")]
     public string? ReasoningEffort { get; set; }
+
+    [JsonPropertyName("response_format")]
+    public ResponseFormat? ResponseFormat { get; set; }
+}
+
+public class ResponseFormat
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "text";
+
+    /// <summary>Used when Type is "json_schema".</summary>
+    [JsonPropertyName("json_schema")]
+    public JsonSchemaFormat? JsonSchema { get; set; }
+}
+
+public class JsonSchemaFormat
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+
+    [JsonPropertyName("schema")]
+    public JsonElement? Schema { get; set; }
+
+    [JsonPropertyName("strict")]
+    public bool? Strict { get; set; }
 }
 
 public class ChatMessage

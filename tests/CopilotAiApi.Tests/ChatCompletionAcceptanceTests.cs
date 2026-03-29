@@ -1,8 +1,12 @@
+using System.Text.Json;
 using Betalgo.Ranul.OpenAI;
 using Betalgo.Ranul.OpenAI.Managers;
 using Betalgo.Ranul.OpenAI.ObjectModels.RequestModels;
 using Betalgo.Ranul.OpenAI.ObjectModels.SharedModels;
 using Microsoft.AspNetCore.Mvc.Testing;
+
+// Alias to avoid conflict with Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ResponseFormat
+using BetalgoResponseFormat = Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ResponseFormat;
 
 namespace CopilotAiApi.Tests;
 
@@ -348,5 +352,75 @@ public class ChatCompletionAcceptanceTests
 
         // Betalgo should parse the error response from our bridge
         Assert.That(result.Successful, Is.False);
+    }
+
+    // ─── Response Format ─────────────────────────────────────────────
+
+    [Test]
+    public async Task ResponseFormat_JsonObject_ReturnsValidJson()
+    {
+        var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
+        {
+            Messages =
+            [
+                ChatMessage.FromUser("Return a JSON object with fields 'name' set to 'Alice' and 'age' set to 30."),
+            ],
+            Model = "gpt-4o",
+            // "json_object" implicitly converts to Betalgo's ResponseFormat struct
+            ResponseFormat = new BetalgoResponseFormat { Type = "json_object" },
+        });
+
+        Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
+        var content = result.Choices[0].Message.Content!;
+
+        // Must be valid JSON
+        var doc = JsonDocument.Parse(content);
+        Assert.That(doc.RootElement.ValueKind, Is.EqualTo(JsonValueKind.Object));
+    }
+
+    [Test]
+    public async Task ResponseFormat_JsonSchema_ReturnsConformantJson()
+    {
+        var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
+        {
+            Messages =
+            [
+                ChatMessage.FromUser("Give me a person named Bob with a score of 95."),
+            ],
+            Model = "gpt-4o",
+            ResponseFormat = new BetalgoResponseFormat
+            {
+                Type = "json_schema",
+                JsonSchema = new JsonSchema
+                {
+                    Name = "person_score",
+                    Description = "A person with a name and numeric score",
+                    Strict = true,
+                    Schema = new PropertyDefinition
+                    {
+                        Type = "object",
+                        Properties = new Dictionary<string, PropertyDefinition>
+                        {
+                            ["name"] = new() { Type = "string" },
+                            ["score"] = new() { Type = "number" },
+                        },
+                        Required = ["name", "score"],
+                    },
+                },
+            },
+        });
+
+        Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
+        var content = result.Choices[0].Message.Content!;
+
+        // Must be valid JSON
+        var doc = JsonDocument.Parse(content);
+        Assert.That(doc.RootElement.ValueKind, Is.EqualTo(JsonValueKind.Object));
+
+        // Must contain required fields
+        Assert.That(doc.RootElement.TryGetProperty("name", out var nameEl), Is.True, "Missing 'name' field");
+        Assert.That(doc.RootElement.TryGetProperty("score", out var scoreEl), Is.True, "Missing 'score' field");
+        Assert.That(nameEl.GetString(), Does.Contain("Bob").IgnoreCase);
+        Assert.That(scoreEl.GetDouble(), Is.EqualTo(95).Within(1));
     }
 }
