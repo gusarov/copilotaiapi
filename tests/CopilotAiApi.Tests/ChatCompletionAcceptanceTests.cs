@@ -4,6 +4,7 @@ using Betalgo.Ranul.OpenAI.Managers;
 using Betalgo.Ranul.OpenAI.ObjectModels.RequestModels;
 using Betalgo.Ranul.OpenAI.ObjectModels.SharedModels;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 
 // Alias to avoid conflict with Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ResponseFormat
 using BetalgoResponseFormat = Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ResponseFormat;
@@ -28,16 +29,32 @@ public class ChatCompletionAcceptanceTests
     private OpenAIService _openAi = null!;
     private HttpClient _rawClient = null!;
 
+    private const string TestApiKey = "sk-test-acceptance-key-12345";
+
     [OneTimeSetUp]
     public void OneTimeSetUp()
     {
-        _factory = new WebApplicationFactory<Program>();
+        _factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                // Inject a test API key so auth middleware is active during tests
+                builder.ConfigureAppConfiguration((_, config) =>
+                {
+                    config.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ApiKeys:acceptance_tests"] = TestApiKey,
+                    });
+                });
+            });
+
         // WAF's HttpClient uses an in-memory handler routed to TestServer.
         // Passing it to OpenAIService makes Betalgo talk to our bridge in-process.
+        // Betalgo sets Authorization: Bearer <ApiKey> on the client automatically.
         _rawClient = _factory.CreateClient();
+
         _openAi = new OpenAIService(new OpenAIOptions
         {
-            ApiKey = "test-key",
+            ApiKey = TestApiKey,
             BaseDomain = _rawClient.BaseAddress!.ToString(),
             ValidateApiOptions = false,
         }, _rawClient);
@@ -422,5 +439,67 @@ public class ChatCompletionAcceptanceTests
         Assert.That(doc.RootElement.TryGetProperty("score", out var scoreEl), Is.True, "Missing 'score' field");
         Assert.That(nameEl.GetString(), Does.Contain("Bob").IgnoreCase);
         Assert.That(scoreEl.GetDouble(), Is.EqualTo(95).Within(1));
+    }
+
+    // ─── Authentication ───────────────────────────────────────────────
+
+    [Test]
+    public async Task Auth_NoToken_Returns401()
+    {
+        using var unauthClient = _factory.CreateClient(); // no auth header
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/chat/completions")
+        {
+            Content = new StringContent(
+                """{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}""",
+                System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await unauthClient.SendAsync(request);
+
+        Assert.That((int)response.StatusCode, Is.EqualTo(401));
+        var body = await response.Content.ReadAsStringAsync();
+        var doc = JsonDocument.Parse(body);
+        Assert.That(doc.RootElement.TryGetProperty("error", out var err), Is.True);
+        Assert.That(err.GetProperty("code").GetString(), Is.EqualTo("invalid_api_key"));
+    }
+
+    [Test]
+    public async Task Auth_WrongToken_Returns401()
+    {
+        using var unauthClient = _factory.CreateClient();
+        unauthClient.DefaultRequestHeaders.Add("Authorization", "Bearer sk-totally-wrong-key");
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/chat/completions")
+        {
+            Content = new StringContent(
+                """{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}""",
+                System.Text.Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await unauthClient.SendAsync(request);
+
+        Assert.That((int)response.StatusCode, Is.EqualTo(401));
+    }
+
+    [Test]
+    public async Task Auth_HealthCheck_IsPublic()
+    {
+        using var unauthClient = _factory.CreateClient(); // no auth header
+        using var response = await unauthClient.GetAsync("/health");
+
+        Assert.That(response.IsSuccessStatusCode, Is.True,
+            "Health endpoint should be publicly accessible without auth");
+    }
+
+    [Test]
+    public async Task Auth_ValidToken_Passes()
+    {
+        // _rawClient already has the valid token set in OneTimeSetUp
+        var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
+        {
+            Messages = [ChatMessage.FromUser("Say 'ok'.")],
+            Model = "gpt-4o",
+        });
+
+        Assert.That(result.Successful, Is.True, () => $"Valid token was rejected: {result.Error?.Message}");
     }
 }

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CopilotAiApi.Middleware;
 using CopilotAiApi.Models;
 using CopilotAiApi.Services;
 
@@ -24,6 +25,7 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 app.UseCors();
+app.UseMiddleware<ApiKeyAuthMiddleware>();
 
 // ─── Health Check ──────────────────────────────────────────────────
 
