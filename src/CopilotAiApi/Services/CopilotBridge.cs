@@ -1,7 +1,8 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
-using GitHub.Copilot.SDK;
+using System.Threading.Channels;
+using GitHub.Copilot;
 using Microsoft.Extensions.AI;
 using CopilotAiApi.Models;
 
@@ -18,6 +19,10 @@ public sealed class CopilotBridge : IAsyncDisposable
     private CopilotClient? _client;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private bool _initialized;
+
+    // Last successfully retrieved live model list, reused as the fallback when
+    // a later ListModelsAsync call fails (CLI unavailable, transient error, etc.).
+    private volatile ModelsResponse? _cachedModels;
 
     public CopilotBridge(ILogger<CopilotBridge> logger, IConfiguration configuration)
     {
@@ -36,12 +41,15 @@ public sealed class CopilotBridge : IAsyncDisposable
 
             var options = new CopilotClientOptions
             {
-                AutoStart = false,
+                // SDK 1.0+ discovers and launches the `copilot` CLI automatically.
+                Mode = CopilotClientMode.CopilotCli,
             };
 
+            // Note: Copilot:CliPath is no longer supported by the SDK (1.0+ resolves
+            // the CLI from PATH). Surface a hint if it was configured.
             var cliPath = _configuration["Copilot:CliPath"];
             if (!string.IsNullOrEmpty(cliPath))
-                options.CliPath = cliPath;
+                _logger.LogWarning("Copilot:CliPath is set but no longer supported by the SDK; ensure the 'copilot' CLI is on PATH.");
 
             var token = _configuration["Copilot:GitHubToken"];
             if (!string.IsNullOrEmpty(token))
@@ -51,6 +59,24 @@ public sealed class CopilotBridge : IAsyncDisposable
             await _client.StartAsync();
             _initialized = true;
             _logger.LogInformation("Copilot SDK client started successfully");
+
+            // Warm up the freshly launched CLI. A cold CLI's first response can
+            // otherwise surface as an SDK event-deserialization error on the very
+            // first chat request; priming the model list negotiates the protocol
+            // and primes the catalog cache before real traffic arrives.
+            // Safe to call ListModelsAsync here: _initialized is already true, so
+            // the re-entrant GetClientAsync returns before taking _initLock.
+            try
+            {
+                var warm = await ListModelsAsync();
+                _logger.LogInformation("Copilot SDK client warmed up ({Count} models)",
+                    warm.Data.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Copilot SDK warmup (ListModelsAsync) failed; continuing without warmup");
+            }
+
             return _client;
         }
         finally
@@ -75,52 +101,65 @@ public sealed class CopilotBridge : IAsyncDisposable
         await using var session = await client.CreateSessionAsync(sessionConfig);
 
         var responseContent = new StringBuilder();
-        var toolRequests = new List<AssistantMessageDataToolRequestsItem>();
+        var toolRequests = new List<AssistantMessageToolRequest>();
         int inputTokens = 0, outputTokens = 0;
+        string? actualModel = null;
         var sessionDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         string? errorMessage = null;
 
-        session.On(evt =>
+        // The SDK may invoke this callback from arbitrary threads. A single lock
+        // guards every shared mutable field so reads and writes are atomic and
+        // properly published across threads — no Interlocked/volatile juggling.
+        var gate = new object();
+
+        session.On<SessionEvent>(evt =>
         {
             _logger.LogDebug("Event received: {EventType}", evt.GetType().Name);
-            switch (evt)
+            lock (gate)
             {
-                case AssistantMessageEvent msg:
-                    if (!string.IsNullOrEmpty(msg.Data.Content))
-                        responseContent.Append(msg.Data.Content);
-                    if (msg.Data.ToolRequests != null && msg.Data.ToolRequests.Any())
-                    {
-                        _logger.LogInformation("Tool requests received: {Count}", msg.Data.ToolRequests.Count());
-                        foreach (var tr in msg.Data.ToolRequests)
-                            _logger.LogInformation("  Tool: {Name}, Args: {Args}", tr.Name, tr.Arguments);
-                        toolRequests.AddRange(msg.Data.ToolRequests);
-                    }
-                    break;
+                switch (evt)
+                {
+                    case AssistantMessageEvent msg:
+                        if (!string.IsNullOrEmpty(msg.Data.Model))
+                            actualModel = msg.Data.Model;
+                        if (!string.IsNullOrEmpty(msg.Data.Content))
+                            responseContent.Append(msg.Data.Content);
+                        if (msg.Data.ToolRequests != null && msg.Data.ToolRequests.Any())
+                        {
+                            _logger.LogInformation("Tool requests received: {Count}", msg.Data.ToolRequests.Count());
+                            foreach (var tr in msg.Data.ToolRequests)
+                                _logger.LogInformation("  Tool: {Name}, Args: {Args}", tr.Name, tr.Arguments);
+                            toolRequests.AddRange(msg.Data.ToolRequests);
+                        }
+                        break;
 
-                case ToolExecutionStartEvent toolStart:
-                    _logger.LogInformation("ToolExecutionStart: {ToolName} (CallId: {CallId})",
-                        toolStart.Data.ToolName, toolStart.Data.ToolCallId);
-                    break;
+                    case ToolExecutionStartEvent toolStart:
+                        _logger.LogInformation("ToolExecutionStart: {ToolName} (CallId: {CallId})",
+                            toolStart.Data.ToolName, toolStart.Data.ToolCallId);
+                        break;
 
-                case AssistantUsageEvent usage:
-                    inputTokens += (int)(usage.Data.InputTokens ?? 0);
-                    outputTokens += (int)(usage.Data.OutputTokens ?? 0);
-                    break;
+                    case AssistantUsageEvent usage:
+                        if (!string.IsNullOrEmpty(usage.Data.Model))
+                            actualModel = usage.Data.Model;
+                        inputTokens += (int)(usage.Data.InputTokens ?? 0);
+                        outputTokens += (int)(usage.Data.OutputTokens ?? 0);
+                        break;
 
-                case SessionIdleEvent:
-                    sessionDone.TrySetResult();
-                    break;
+                    case SessionIdleEvent:
+                        sessionDone.TrySetResult();
+                        break;
 
-                case SessionErrorEvent err:
-                    errorMessage = err.Data?.Message ?? "Unknown session error";
-                    _logger.LogWarning("SessionError: {Error}", errorMessage);
-                    sessionDone.TrySetResult();
-                    break;
+                    case SessionErrorEvent err:
+                        errorMessage = err.Data?.Message ?? "Unknown session error";
+                        _logger.LogWarning("SessionError: {Error}", errorMessage);
+                        sessionDone.TrySetResult();
+                        break;
 
-                default:
-                    _logger.LogDebug("Unhandled event: {EventType} - {Data}", evt.GetType().Name,
-                        JsonSerializer.Serialize(evt, new JsonSerializerOptions { WriteIndented = false }));
-                    break;
+                    default:
+                        _logger.LogDebug("Unhandled event: {EventType} - {Data}", evt.GetType().Name,
+                            JsonSerializer.Serialize(evt, new JsonSerializerOptions { WriteIndented = false }));
+                        break;
+                }
             }
         });
 
@@ -139,29 +178,50 @@ public sealed class CopilotBridge : IAsyncDisposable
             throw new TimeoutException("Copilot session timed out after 5 minutes");
         }
 
-        if (errorMessage != null)
+        // Snapshot all shared state under the lock for a consistent, safely
+        // published view (the SDK handler may run on other threads).
+        string? errMsg;
+        List<AssistantMessageToolRequest> capturedToolRequests;
+        string? capturedModel;
+        int capturedInput, capturedOutput;
+        string capturedContent;
+        lock (gate)
         {
-            _logger.LogWarning("Session error: {Error}", errorMessage);
-            throw new InvalidOperationException($"Copilot session error: {errorMessage}");
+            errMsg = errorMessage;
+            capturedToolRequests = toolRequests.ToList();
+            capturedModel = actualModel;
+            capturedInput = inputTokens;
+            capturedOutput = outputTokens;
+            capturedContent = responseContent.ToString();
+        }
+
+        if (errMsg != null)
+        {
+            _logger.LogWarning("Session error: {Error}", errMsg);
+            throw new InvalidOperationException($"Copilot session error: {errMsg}");
         }
 
         // Check if model wants to call client-defined tools
         var clientToolNames = request.Tools?.Select(t => t.Function.Name).ToHashSet() ?? new HashSet<string>();
-        var clientToolRequests = toolRequests
+        var clientToolRequests = capturedToolRequests
             .Where(tr => clientToolNames.Contains(tr.Name ?? ""))
             .ToList();
 
+        // Echo the model that actually served the request (from the SDK event),
+        // falling back to the requested id if the SDK did not report one.
+        var responseModel = capturedModel ?? request.Model;
+
         if (clientToolRequests.Count > 0)
         {
-            return BuildToolCallsResponse(completionId, created, request.Model,
-                clientToolRequests, inputTokens, outputTokens);
+            return BuildToolCallsResponse(completionId, created, responseModel,
+                clientToolRequests, capturedInput, capturedOutput);
         }
 
         return new ChatCompletionResponse
         {
             Id = completionId,
             Created = created,
-            Model = request.Model,
+            Model = responseModel,
             Choices = new List<Choice>
             {
                 new()
@@ -170,16 +230,16 @@ public sealed class CopilotBridge : IAsyncDisposable
                     Message = new ResponseMessage
                     {
                         Role = "assistant",
-                        Content = SanitizeContent(responseContent.ToString(), request.ResponseFormat),
+                        Content = SanitizeContent(capturedContent, request.ResponseFormat),
                     },
                     FinishReason = "stop",
                 }
             },
             Usage = new Usage
             {
-                PromptTokens = inputTokens,
-                CompletionTokens = outputTokens,
-                TotalTokens = inputTokens + outputTokens,
+                PromptTokens = capturedInput,
+                CompletionTokens = capturedOutput,
+                TotalTokens = capturedInput + capturedOutput,
             }
         };
     }
@@ -207,133 +267,187 @@ public sealed class CopilotBridge : IAsyncDisposable
         httpContext.Response.Headers["X-Accel-Buffering"] = "no";
 
         var clientToolNames = request.Tools?.Select(t => t.Function.Name).ToHashSet() ?? new HashSet<string>();
-        var toolRequests = new List<AssistantMessageDataToolRequestsItem>();
+        var toolRequests = new List<AssistantMessageToolRequest>();
+        string? actualModel = null;
         var sessionDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // All SSE chunks flow through this channel and are written by the single
+        // consumer loop below in arrival order. HttpResponse.Body does NOT support
+        // concurrent/overlapping writes, so the event handler must never write
+        // directly — it only enqueues.
+        var chunks = Channel.CreateUnbounded<ChatCompletionChunk>(
+            new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+        // Guards the shared mutable state below (roleSent, actualModel, toolRequests).
+        // The SDK may raise events from arbitrary threads; the consumer (FinalizeAsync)
+        // also reads this state, so every access goes through this single lock.
+        var gate = new object();
         bool roleSent = false;
 
-        session.On(evt =>
+        session.On<SessionEvent>(evt =>
         {
-            switch (evt)
+            lock (gate)
             {
-                case AssistantMessageDeltaEvent delta:
-                    if (!string.IsNullOrEmpty(delta.Data.DeltaContent))
-                    {
-                        var chunk = new ChatCompletionChunk
+                switch (evt)
+                {
+                    case AssistantMessageDeltaEvent delta:
+                        if (!string.IsNullOrEmpty(delta.Data.DeltaContent))
                         {
-                            Id = completionId,
-                            Created = created,
-                            Model = request.Model,
-                            Choices = new()
+                            var first = !roleSent;
+                            roleSent = true;
+                            chunks.Writer.TryWrite(new ChatCompletionChunk
                             {
-                                new StreamChoice
+                                Id = completionId,
+                                Created = created,
+                                Model = actualModel ?? request.Model,
+                                Choices = new()
                                 {
-                                    Index = 0,
-                                    Delta = new DeltaMessage
+                                    new StreamChoice
                                     {
-                                        Role = roleSent ? null : "assistant",
-                                        Content = delta.Data.DeltaContent,
+                                        Index = 0,
+                                        Delta = new DeltaMessage
+                                        {
+                                            Role = first ? "assistant" : null,
+                                            Content = delta.Data.DeltaContent,
+                                        }
                                     }
                                 }
-                            }
-                        };
-                        roleSent = true;
-                        _ = WriteSseChunkAsync(httpContext, chunk, cancellationToken);
-                    }
-                    break;
+                            });
+                        }
+                        break;
 
-                case AssistantMessageEvent msg:
-                    if (msg.Data.ToolRequests != null && msg.Data.ToolRequests.Any())
-                    {
-                        var clientTools = msg.Data.ToolRequests
-                            .Where(tr => clientToolNames.Contains(tr.Name ?? ""))
-                            .ToList();
-                        toolRequests.AddRange(clientTools);
-                    }
-                    break;
+                    case AssistantMessageEvent msg:
+                        if (!string.IsNullOrEmpty(msg.Data.Model))
+                            actualModel = msg.Data.Model;
+                        if (msg.Data.ToolRequests != null && msg.Data.ToolRequests.Any())
+                        {
+                            var clientTools = msg.Data.ToolRequests
+                                .Where(tr => clientToolNames.Contains(tr.Name ?? ""))
+                                .ToList();
+                            toolRequests.AddRange(clientTools);
+                        }
+                        break;
 
-                case SessionIdleEvent:
-                    sessionDone.TrySetResult();
-                    break;
+                    case AssistantUsageEvent usage:
+                        if (!string.IsNullOrEmpty(usage.Data.Model))
+                            actualModel = usage.Data.Model;
+                        break;
 
-                case SessionErrorEvent:
-                    sessionDone.TrySetResult();
-                    break;
+                    case SessionIdleEvent:
+                        sessionDone.TrySetResult();
+                        break;
+
+                    case SessionErrorEvent:
+                        sessionDone.TrySetResult();
+                        break;
+                }
             }
         });
 
-        // Send initial role chunk
-        var roleChunk = new ChatCompletionChunk
+        // Initial role chunk, enqueued before SendAsync so it is the first thing written.
+        string? initialModel;
+        lock (gate)
+        {
+            roleSent = true;
+            initialModel = actualModel;
+        }
+        chunks.Writer.TryWrite(new ChatCompletionChunk
         {
             Id = completionId,
             Created = created,
-            Model = request.Model,
+            Model = initialModel ?? request.Model,
             Choices = new() { new StreamChoice { Delta = new DeltaMessage { Role = "assistant" } } }
-        };
-        await WriteSseChunkAsync(httpContext, roleChunk, cancellationToken);
-        roleSent = true;
+        });
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromMinutes(5));
+        // Waits for the session to finish, enqueues the terminal chunks, then closes
+        // the channel. Runs concurrently with the writer loop so deltas stream out as
+        // they arrive instead of being buffered until completion.
+        async Task FinalizeAsync()
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromMinutes(5));
+            try
+            {
+                await sessionDone.Task.WaitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException) { /* best effort */ }
+
+            // Snapshot shared state under the lock; the SDK event handler may have
+            // mutated it on another thread right up until SessionIdle/Error.
+            List<AssistantMessageToolRequest> finalToolRequests;
+            string finalModel;
+            lock (gate)
+            {
+                finalToolRequests = toolRequests.ToList();
+                finalModel = actualModel ?? request.Model;
+            }
+
+            if (finalToolRequests.Count > 0)
+            {
+                chunks.Writer.TryWrite(new ChatCompletionChunk
+                {
+                    Id = completionId,
+                    Created = created,
+                    Model = finalModel,
+                    Choices = new()
+                    {
+                        new StreamChoice
+                        {
+                            Index = 0,
+                            Delta = new DeltaMessage
+                            {
+                                ToolCalls = finalToolRequests.Select((tr, idx) => new StreamToolCall
+                                {
+                                    Index = idx,
+                                    Id = tr.ToolCallId ?? $"call_{Guid.NewGuid():N}",
+                                    Type = "function",
+                                    Function = new StreamFunctionCall
+                                    {
+                                        Name = tr.Name,
+                                        Arguments = tr.Arguments?.ToString() ?? "{}",
+                                    }
+                                }).ToList()
+                            },
+                            FinishReason = null,
+                        }
+                    }
+                });
+                chunks.Writer.TryWrite(new ChatCompletionChunk
+                {
+                    Id = completionId, Created = created, Model = finalModel,
+                    Choices = new() { new StreamChoice { Delta = new DeltaMessage(), FinishReason = "tool_calls" } }
+                });
+            }
+            else
+            {
+                chunks.Writer.TryWrite(new ChatCompletionChunk
+                {
+                    Id = completionId, Created = created, Model = finalModel,
+                    Choices = new() { new StreamChoice { Delta = new DeltaMessage(), FinishReason = "stop" } }
+                });
+            }
+
+            chunks.Writer.TryComplete();
+        }
+
+        var finalizeTask = FinalizeAsync();
 
         try
         {
-            await sessionDone.Task.WaitAsync(timeoutCts.Token);
+            // Single writer: drains the channel and writes chunks in order.
+            await foreach (var chunk in chunks.Reader.ReadAllAsync(cancellationToken))
+                await WriteSseChunkAsync(httpContext, chunk, cancellationToken);
         }
-        catch (OperationCanceledException) { /* best effort */ }
-
-        // If tool calls were detected, stream them
-        if (toolRequests.Count > 0)
+        finally
         {
-            var toolChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = created,
-                Model = request.Model,
-                Choices = new()
-                {
-                    new StreamChoice
-                    {
-                        Index = 0,
-                        Delta = new DeltaMessage
-                        {
-                            ToolCalls = toolRequests.Select((tr, idx) => new StreamToolCall
-                            {
-                                Index = idx,
-                                Id = tr.ToolCallId ?? $"call_{Guid.NewGuid():N}",
-                                Type = "function",
-                                Function = new StreamFunctionCall
-                                {
-                                    Name = tr.Name,
-                                    Arguments = tr.Arguments?.ToString() ?? "{}",
-                                }
-                            }).ToList()
-                        },
-                        FinishReason = null,
-                    }
-                }
-            };
-            await WriteSseChunkAsync(httpContext, toolChunk, cancellationToken);
+            chunks.Writer.TryComplete();
+            try { await finalizeTask; } catch { /* best effort */ }
+        }
 
-            // Final chunk with finish_reason
-            var doneChunk = new ChatCompletionChunk
-            {
-                Id = completionId, Created = created, Model = request.Model,
-                Choices = new() { new StreamChoice { Delta = new DeltaMessage(), FinishReason = "tool_calls" } }
-            };
-            await WriteSseChunkAsync(httpContext, doneChunk, cancellationToken);
-        }
-        else
-        {
-            // Final chunk with stop reason
-            var doneChunk = new ChatCompletionChunk
-            {
-                Id = completionId, Created = created, Model = request.Model,
-                Choices = new() { new StreamChoice { Delta = new DeltaMessage(), FinishReason = "stop" } }
-            };
-            await WriteSseChunkAsync(httpContext, doneChunk, cancellationToken);
-        }
+        if (cancellationToken.IsCancellationRequested)
+            return;
 
         // Send [DONE]
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
@@ -349,7 +463,7 @@ public sealed class CopilotBridge : IAsyncDisposable
         {
             var models = await client.ListModelsAsync();
             var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            return new ModelsResponse
+            var response = new ModelsResponse
             {
                 Data = models.Select(m => new ModelData
                 {
@@ -358,11 +472,26 @@ public sealed class CopilotBridge : IAsyncDisposable
                     OwnedBy = "github-copilot",
                 }).ToList()
             };
+
+            // Cache the live list so a later failure can serve real data
+            // instead of the static fallback.
+            if (response.Data.Count > 0)
+                _cachedModels = response;
+
+            return response;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to list models from Copilot SDK, returning defaults");
-            return GetDefaultModels();
+            // Prefer the last successful live list; only resort to the static
+            // configurable fallback if we have never retrieved one.
+            if (_cachedModels != null)
+            {
+                _logger.LogWarning(ex, "Failed to list models from Copilot SDK, returning last cached list");
+                return _cachedModels;
+            }
+
+            _logger.LogWarning(ex, "Failed to list models from Copilot SDK, returning configured fallback");
+            return GetFallbackModels();
         }
     }
 
@@ -395,7 +524,7 @@ public sealed class CopilotBridge : IAsyncDisposable
         if (request.Tools?.Count > 0)
         {
             config.Tools = request.Tools
-                .Select(t => (AIFunction)new ProxyAIFunction(
+                .Select(t => (AIFunctionDeclaration)new ProxyAIFunction(
                     t.Function.Name,
                     t.Function.Description ?? "",
                     t.Function.Parameters))
@@ -517,7 +646,7 @@ public sealed class CopilotBridge : IAsyncDisposable
 
     private static ChatCompletionResponse BuildToolCallsResponse(
         string completionId, long created, string model,
-        List<AssistantMessageDataToolRequestsItem> toolRequests,
+        List<AssistantMessageToolRequest> toolRequests,
         int inputTokens, int outputTokens)
     {
         return new ChatCompletionResponse
@@ -592,15 +721,31 @@ public sealed class CopilotBridge : IAsyncDisposable
         return trimmed.Trim();
     }
 
-    private static ModelsResponse GetDefaultModels()
+    private ModelsResponse GetFallbackModels()
     {
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var defaultModels = new[] { "gpt-5", "gpt-4.1", "gpt-4o", "claude-sonnet-4.5", "claude-sonnet-4", "o3", "o4-mini" };
+
+        // Allow overriding the static fallback via configuration
+        // (appsettings.json "Copilot:FallbackModels" or COPILOT__FALLBACKMODELS env var).
+        var configured = _configuration.GetSection("Copilot:FallbackModels").Get<string[]>();
+        var fallbackModels = configured is { Length: > 0 }
+            ? configured
+            : DefaultFallbackModels;
+
         return new ModelsResponse
         {
-            Data = defaultModels.Select(m => new ModelData { Id = m, Created = created }).ToList()
+            Data = fallbackModels
+                .Where(m => !string.IsNullOrWhiteSpace(m))
+                .Select(m => new ModelData { Id = m, Created = created })
+                .ToList()
         };
     }
+
+    private static readonly string[] DefaultFallbackModels =
+    {
+        "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6", "claude-sonnet-4.5",
+        "gpt-5.5", "gpt-5.4", "gpt-5-mini", "gemini-3.5-flash"
+    };
 
     public async ValueTask DisposeAsync()
     {

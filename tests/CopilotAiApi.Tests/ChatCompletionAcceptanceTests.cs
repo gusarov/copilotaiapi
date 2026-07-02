@@ -30,6 +30,10 @@ public class ChatCompletionAcceptanceTests
     private HttpClient _rawClient = null!;
 
     private const string TestApiKey = "sk-test-acceptance-key-12345";
+    // Model used by the live acceptance tests. Must be a valid id in the Copilot
+    // catalog (strict validation rejects unknown ids). A small/fast model keeps
+    // test runs cheap; the bridge's own default is claude-opus-4.8.
+    private const string TestModel = "gpt-5-mini";
 
     [OneTimeSetUp]
     public void OneTimeSetUp()
@@ -76,7 +80,7 @@ public class ChatCompletionAcceptanceTests
         var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
             Messages = [ChatMessage.FromUser("Reply with exactly the word 'pong' and nothing else.")],
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -95,7 +99,7 @@ public class ChatCompletionAcceptanceTests
                 ChatMessage.FromSystem("You are a pirate. Every response MUST contain the word 'Arrr'."),
                 ChatMessage.FromUser("Hello there"),
             ],
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -113,7 +117,7 @@ public class ChatCompletionAcceptanceTests
                 ChatMessage.FromAssistant("Nice to meet you, Zephyr!"),
                 ChatMessage.FromUser("What is my name? Reply with just the name."),
             ],
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -128,7 +132,7 @@ public class ChatCompletionAcceptanceTests
         var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
             Messages = [ChatMessage.FromUser("Say hi.")],
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -161,7 +165,7 @@ public class ChatCompletionAcceptanceTests
         // which TestServer doesn't support. Use the raw HttpClient with SSE instead.
         var requestBody = System.Text.Json.JsonSerializer.Serialize(new
         {
-            model = "gpt-4o",
+            model = TestModel,
             messages = new[] { new { role = "user", content = "Count from 1 to 3, one number per line." } },
             stream = true,
         });
@@ -247,7 +251,7 @@ public class ChatCompletionAcceptanceTests
         {
             Messages = [ChatMessage.FromUser("What's the weather in London?")],
             Tools = WeatherTool,
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -292,7 +296,7 @@ public class ChatCompletionAcceptanceTests
                 ChatMessage.FromTool("{\"temp_c\": 22, \"condition\": \"Sunny\"}", toolCallId),
             ],
             Tools = WeatherTool,
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -348,7 +352,7 @@ public class ChatCompletionAcceptanceTests
         {
             Messages = [ChatMessage.FromUser("What time is it in Berlin?")],
             Tools = tools,
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         Assert.That(result.Successful, Is.True, () => $"API error: {result.Error?.Message}");
@@ -364,7 +368,7 @@ public class ChatCompletionAcceptanceTests
         var result = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
             Messages = [],
-            Model = "gpt-4o",
+            Model = TestModel,
         });
 
         // Betalgo should parse the error response from our bridge
@@ -382,7 +386,7 @@ public class ChatCompletionAcceptanceTests
             [
                 ChatMessage.FromUser("Return a JSON object with fields 'name' set to 'Alice' and 'age' set to 30."),
             ],
-            Model = "gpt-4o",
+            Model = TestModel,
             // "json_object" implicitly converts to Betalgo's ResponseFormat struct
             ResponseFormat = new BetalgoResponseFormat { Type = "json_object" },
         });
@@ -404,7 +408,7 @@ public class ChatCompletionAcceptanceTests
             [
                 ChatMessage.FromUser("Give me a person named Bob with a score of 95."),
             ],
-            Model = "gpt-4o",
+            Model = TestModel,
             ResponseFormat = new BetalgoResponseFormat
             {
                 Type = "json_schema",

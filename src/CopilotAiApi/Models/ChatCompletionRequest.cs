@@ -6,7 +6,7 @@ namespace CopilotAiApi.Models;
 public class ChatCompletionRequest
 {
     [JsonPropertyName("model")]
-    public string Model { get; set; } = "gpt-4o";
+    public string Model { get; set; } = "claude-opus-4.8";
 
     [JsonPropertyName("messages")]
     public List<ChatMessage> Messages { get; set; } = new();
