@@ -525,11 +525,11 @@ public sealed class CopilotBridge : IAsyncDisposable
         {
             config.Tools = request.Tools
                 .Select(t => (AIFunctionDeclaration)new ProxyAIFunction(
-                    t.Function.Name,
-                    t.Function.Description ?? "",
-                    t.Function.Parameters))
+                            t.Function.Name,
+                            t.Function.Description ?? "",
+                            t.Function.Parameters,
+                            overridesBuiltIn: true))
                 .ToList();
-
             // Enable only client-defined tools, disable all built-in tools
             config.AvailableTools = request.Tools.Select(t => t.Function.Name).ToList();
         }

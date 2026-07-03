@@ -14,31 +14,36 @@ public sealed class ProxyAIFunction : AIFunction
     private readonly string _name;
     private readonly string _description;
     private readonly JsonElement _jsonSchema;
+    private readonly Dictionary<string, object?> _additionalProps = new();
 
-    public ProxyAIFunction(string name, string description, JsonElement? parametersSchema)
+    public ProxyAIFunction(string name, string description, JsonElement? parametersSchema, bool overridesBuiltIn = false)
     {
         _name = name;
         _description = description;
-        // Build a function-level JSON schema from the OpenAI parameters schema
         _jsonSchema = BuildFunctionSchema(name, description, parametersSchema);
+
+        // Allow this tool to override a Copilot built-in tool with the same name (e.g. "bash")
+        if (overridesBuiltIn)
+        {
+            _additionalProps["is_override"] = true;
+        }
     }
+
+    public override IReadOnlyDictionary<string, object?> AdditionalProperties => _additionalProps;
 
     public override string Name => _name;
     public override string Description => _description;
     public override JsonElement JsonSchema => _jsonSchema;
 
     protected override ValueTask<object?> InvokeCoreAsync(
-        AIFunctionArguments arguments,
-        CancellationToken cancellationToken)
+            AIFunctionArguments arguments,
+            CancellationToken cancellationToken)
     {
-        // This handler should never be called in normal operation.
-        // We abort the session before tool execution begins.
         return new ValueTask<object?>("Tool call intercepted by bridge");
     }
 
     private static JsonElement BuildFunctionSchema(string name, string description, JsonElement? parameters)
     {
-        // The JSON schema expected by the SDK wraps the parameters in a function-style schema
         var schema = new Dictionary<string, object?>
         {
             ["title"] = name,
@@ -48,7 +53,6 @@ public sealed class ProxyAIFunction : AIFunction
 
         if (parameters.HasValue && parameters.Value.ValueKind == JsonValueKind.Object)
         {
-            // Merge the OpenAI parameters schema properties into our schema
             if (parameters.Value.TryGetProperty("properties", out var props))
                 schema["properties"] = props;
             if (parameters.Value.TryGetProperty("required", out var req))
